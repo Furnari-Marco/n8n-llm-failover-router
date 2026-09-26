@@ -1,0 +1,34 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Workflow export matches src/
+        run: npm run sync:check
+      - name: Workflow tests
+        run: npm test
+
+  e2e:
+    # The same workflow on a real n8n, against scripted providers.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Install n8n
+        run: npm run e2e:install
+      - name: End-to-end tests
+        run: npm run e2e

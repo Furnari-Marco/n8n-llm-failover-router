@@ -1,0 +1,671 @@
+{
+  "name": "LLM failover router",
+  "nodes": [
+    {
+      "id": "c2e33e26-6bb1-4236-9298-1018e649508e",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -340,
+        40
+      ],
+      "parameters": {
+        "width": 460,
+        "height": 420,
+        "color": 7,
+        "content": "## LLM failover router\nA chat endpoint that answers from the first available provider (Gemini, then Groq, then OpenRouter) and remembers each conversation.\n\n**Setup**\n1. Create one *Header Auth* credential per provider: name `Authorization`, value `Bearer <API key>`, and select it in each *chat completion* node.\n2. In *Webhook* > *Allowed Origins (CORS)*, set the site that hosts the chat.\n3. Adjust the prompt and limits at the top of *Validate request*.\n4. Publish, then POST `{\"session_id\": \"...\", \"message\": \"...\"}` to the production URL.\n\nA provider that hits its quota rests for 30 minutes, one that is down for 5. `/status` shows the cooldowns, `/reset` clears the conversation."
+      }
+    },
+    {
+      "id": "01b6629f-62f1-4ce7-b33b-1b7138ee2341",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        200,
+        300
+      ],
+      "webhookId": "16c5fd06-484e-471a-bd69-e7db9af33946",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "llm-chat",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "https://chat.example.com"
+        }
+      }
+    },
+    {
+      "id": "2706553f-c917-4c47-92c8-eb57ddb11c74",
+      "name": "Validate request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Validates the request, applies rate limits and loads the conversation.\n// Everything that can turn a request away happens here, before any provider is called.\n\nconst SYSTEM_PROMPT = 'You are a helpful assistant. Answer clearly and concisely, and say so when you do not know something.';\nconst PROVIDERS = ['gemini', 'groq', 'openrouter']; // same order as the branches in the workflow\nconst MAX_MESSAGE_CHARS = 4000;\nconst HISTORY_MESSAGES = 24;   // messages kept per session, and sent to the model\nconst SESSION_TTL_HOURS = 24;\nconst MAX_SESSIONS = 100;      // static data is meant to stay small\nconst RATE_WINDOW_MINUTES = 10;\nconst RATE_PER_SESSION = 20;\nconst RATE_GLOBAL = 120;       // caps spend even when a caller rotates session ids\n\nconst request = $input.first().json;\nconst body = request.body ?? {};\nconst headers = request.headers ?? {};\n\nconst respondNow = (status, payload) => [{ json: { respondNow: true, status, payload } }];\nconst reject = (status, code, message) => respondNow(status, { error: { code, message } });\n\n// CORS only stops a browser from reading the response: the request itself still runs and\n// still spends quota. A browser on a site that is not allowed is therefore refused here.\n// The allowed list is read from the Webhook node, so it is configured in one place.\nconst allowedOrigins = String($('Webhook').params.options?.allowedOrigins ?? '*')\n  .split(',').map((origin) => origin.trim()).filter(Boolean);\nif (headers.origin && !allowedOrigins.includes('*') && !allowedOrigins.includes(headers.origin)) {\n  return reject(403, 'origin_not_allowed', 'This origin is not allowed to call the endpoint.');\n}\n\n// There is no shared fallback session: a missing id must never merge two users' conversations.\nconst sessionId = typeof body.session_id === 'string' ? body.session_id.trim() : '';\nif (!/^[A-Za-z0-9_-]{8,64}$/.test(sessionId)) {\n  return reject(400, 'invalid_session_id', 'session_id is required: 8 to 64 letters, digits, \"-\" or \"_\".');\n}\nconst message = typeof body.message === 'string' ? body.message.trim() : '';\nif (!message) {\n  return reject(400, 'empty_message', 'message is required.');\n}\nif (message.length > MAX_MESSAGE_CHARS) {\n  return reject(413, 'message_too_long', `message is limited to ${MAX_MESSAGE_CHARS} characters.`);\n}\n\nconst store = $getWorkflowStaticData('global');\nstore.sessions ??= {};\nstore.cooldowns ??= {};\nstore.hits ??= {};\nconst now = Date.now();\n\n// Housekeeping runs on every request, so the store is bounded without a scheduled job.\nfor (const [id, session] of Object.entries(store.sessions)) {\n  if (!(now - Date.parse(session.updatedAt) <= SESSION_TTL_HOURS * 3600e3)) delete store.sessions[id];\n}\nconst oldestFirst = Object.keys(store.sessions)\n  .sort((a, b) => Date.parse(store.sessions[a].updatedAt) - Date.parse(store.sessions[b].updatedAt));\nfor (const id of oldestFirst.slice(0, Math.max(0, oldestFirst.length - MAX_SESSIONS))) delete store.sessions[id];\n\n// Sliding-window rate limits, per session and in total.\nconst windowStart = now - RATE_WINDOW_MINUTES * 60e3;\nfor (const [key, times] of Object.entries(store.hits)) {\n  const recent = times.filter((t) => t > windowStart);\n  if (recent.length) store.hits[key] = recent;\n  else delete store.hits[key];\n}\nconst sessionKey = `session:${sessionId}`;\nif ((store.hits.global?.length ?? 0) >= RATE_GLOBAL || (store.hits[sessionKey]?.length ?? 0) >= RATE_PER_SESSION) {\n  return reject(429, 'rate_limited', 'Too many requests. Try again in a few minutes.');\n}\nstore.hits.global = [...(store.hits.global ?? []), now];\nstore.hits[sessionKey] = [...(store.hits[sessionKey] ?? []), now];\n\nconst stored = store.sessions[sessionId]?.messages ?? [];\n\nif (message === '/reset') {\n  delete store.sessions[sessionId];\n  return respondNow(200, { session_id: sessionId, reset: true });\n}\nif (message === '/status') {\n  const cooldowns = Object.fromEntries(Object.entries(store.cooldowns)\n    .filter(([, until]) => until > now)\n    .map(([provider, until]) => [provider, new Date(until).toISOString()]));\n  return respondNow(200, { session_id: sessionId, messages: stored.length, cooldowns });\n}\n\n// A copy, not a reference: the stored session changes only once a provider has answered.\nconst history = [...stored, { role: 'user', content: message }].slice(-HISTORY_MESSAGES);\n\nreturn [{\n  json: {\n    respondNow: false,\n    sessionId,\n    history,\n    historyLimit: HISTORY_MESSAGES,\n    messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...history],\n    available: Object.fromEntries(PROVIDERS.map((p) => [p, !(store.cooldowns[p] > now)])),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "167004b2-2011-489f-aab8-a7e967875e7e",
+      "name": "Respond now?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        640,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "20e8131f-a107-434c-9d82-b5dfbfc75a74",
+              "leftValue": "={{ $json.respondNow }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "2671a11d-0573-4695-9101-271e033851ed",
+      "name": "Respond: immediate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        80
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "responseCode": "={{ $json.status }}"
+        }
+      }
+    },
+    {
+      "id": "5f4dedd6-58c0-4ada-84d2-d7077c02fda2",
+      "name": "Save turn",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        560
+      ],
+      "parameters": {
+        "jsCode": "// A provider has answered: only now is the turn written to the session.\n\nconst turn = $input.first().json;\nconst store = $getWorkflowStaticData('global');\nstore.sessions ??= {};\nstore.cooldowns ??= {};\n\nconst messages = [...turn.history, { role: 'assistant', content: turn.reply }].slice(-turn.historyLimit);\nstore.sessions[turn.sessionId] = { messages, updatedAt: new Date().toISOString() };\n\n// A provider that answers is healthy again, whatever its cooldown said.\ndelete store.cooldowns[turn.provider];\n\nreturn [{\n  json: {\n    session_id: turn.sessionId,\n    reply: turn.reply,\n    provider: turn.provider,\n    model: turn.model,\n    usage: turn.usage,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "7bf634fd-0b8b-4cdf-8402-ad3ac6d74dbd",
+      "name": "Respond: reply",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1820,
+        560
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "eee234db-1924-4d91-8cc9-b2655b207c3a",
+      "name": "Respond: all providers down",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        1240
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ error: { code: 'all_providers_unavailable', message: 'No provider could answer. Try again in a few minutes.', last_failure: $json.lastFailure ? { provider: $json.lastFailure.provider, reason: $json.lastFailure.reason } : null } }) }}",
+        "options": {
+          "responseCode": 503
+        }
+      }
+    },
+    {
+      "id": "b9a3a896-745a-4681-b4bc-39165953b88f",
+      "name": "Gemini available?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "daecc255-76e5-4a3b-a9b1-8f08a1f093cd",
+              "leftValue": "={{ $json.available.gemini }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "684b76fe-3766-4394-8f0c-e9ff35cbddf3",
+      "name": "Gemini: chat completion",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        300
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { model: 'gemini-flash-latest', messages: $json.messages, temperature: 0.5, max_tokens: 2048 } }}",
+        "options": {
+          "timeout": 45000
+        }
+      }
+    },
+    {
+      "id": "e95e91cc-d59c-4ccf-bb5d-ae220018713f",
+      "name": "Gemini: parse reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        220
+      ],
+      "parameters": {
+        "jsCode": "// Extracts the reply from an OpenAI-compatible response.\n// An empty or malformed answer is thrown on purpose: the node's error output\n// sends it to the failure handler, and the next provider gets a chance.\n\nconst PROVIDER = 'gemini';\n\nconst response = $input.first().json;\nconst reply = response.choices?.[0]?.message?.content;\nif (typeof reply !== 'string' || !reply.trim()) {\n  throw new Error(`${PROVIDER} returned an empty or malformed response`);\n}\n\nreturn [{\n  json: {\n    ...$('Validate request').first().json,\n    provider: PROVIDER,\n    model: response.model ?? null,\n    reply,\n    usage: response.usage ?? null,\n  },\n}];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "949cda18-917a-4bf1-8d24-049e9a7298c0",
+      "name": "Gemini: record failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        420
+      ],
+      "parameters": {
+        "jsCode": "// gemini has failed: record a cooldown when waiting is likely to help,\n// then hand the untouched conversation to the next provider.\n//\n// An error output carries only { error }, not the item that went in. The context is\n// therefore re-read from 'Validate request'; without this step the next provider\n// would be called with an empty request.\n\nconst PROVIDER = 'gemini';\nconst QUOTA_COOLDOWN_MINUTES = 30;  // a 429 can be a per-minute or a per-day limit: 30 minutes covers most of both\nconst OUTAGE_COOLDOWN_MINUTES = 5;\nconst NETWORK_CODES = new Set(['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);\n\n// From the HTTP Request node: { message, code, status, stack }. From the parse node: a string.\n// Only the structured fields are read. The stack is never searched: its line numbers\n// (events:521:24) look exactly like HTTP status codes.\nconst error = $input.first().json.error;\nconst message = String(typeof error === 'string' ? error : error?.message ?? 'unknown error');\nconst status = Number(error?.status ?? error?.httpCode) || null;\nconst code = String(error?.code ?? '');\n\nfunction classify() {\n  if (status === 429) return 'quota';\n  if (status >= 500) return 'outage';\n  // Some APIs report an exhausted quota as a 400 or a 403.\n  if (status >= 400) return /quota|rate.?limit|resource.?exhausted/i.test(message) ? 'quota' : 'rejected';\n  if (NETWORK_CODES.has(code)) return 'outage';\n  return 'bad_response';\n}\nconst reason = classify();\n\n// 'rejected' (bad key, unknown model) and 'bad_response' get no cooldown:\n// the first needs a configuration fix that waiting will not bring, the second is often a one-off.\nconst minutes = { quota: QUOTA_COOLDOWN_MINUTES, outage: OUTAGE_COOLDOWN_MINUTES }[reason] ?? 0;\nif (minutes) {\n  const store = $getWorkflowStaticData('global');\n  store.cooldowns ??= {};\n  store.cooldowns[PROVIDER] = Date.now() + minutes * 60e3;\n}\n\nreturn [{\n  json: {\n    ...$('Validate request').first().json,\n    lastFailure: { provider: PROVIDER, reason, status, message: message.slice(0, 300) },\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "a4e2d42a-6e12-42fe-b264-a7ec563c2e37",
+      "name": "Groq available?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        620
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "80d157ab-159d-4060-8aea-cd748ea0f5f1",
+              "leftValue": "={{ $json.available.groq }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "c27a7dab-e9ff-49a3-a0be-188d05c9121f",
+      "name": "Groq: chat completion",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        620
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { model: 'llama-3.3-70b-versatile', messages: $json.messages, temperature: 0.5, max_tokens: 2048 } }}",
+        "options": {
+          "timeout": 45000
+        }
+      }
+    },
+    {
+      "id": "9f70592a-e835-428f-9dfb-41a45e2d3817",
+      "name": "Groq: parse reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        540
+      ],
+      "parameters": {
+        "jsCode": "// Extracts the reply from an OpenAI-compatible response.\n// An empty or malformed answer is thrown on purpose: the node's error output\n// sends it to the failure handler, and the next provider gets a chance.\n\nconst PROVIDER = 'groq';\n\nconst response = $input.first().json;\nconst reply = response.choices?.[0]?.message?.content;\nif (typeof reply !== 'string' || !reply.trim()) {\n  throw new Error(`${PROVIDER} returned an empty or malformed response`);\n}\n\nreturn [{\n  json: {\n    ...$('Validate request').first().json,\n    provider: PROVIDER,\n    model: response.model ?? null,\n    reply,\n    usage: response.usage ?? null,\n  },\n}];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "cd0a79d3-81b3-4adf-8648-33e2db17af5d",
+      "name": "Groq: record failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        740
+      ],
+      "parameters": {
+        "jsCode": "// groq has failed: record a cooldown when waiting is likely to help,\n// then hand the untouched conversation to the next provider.\n//\n// An error output carries only { error }, not the item that went in. The context is\n// therefore re-read from 'Validate request'; without this step the next provider\n// would be called with an empty request.\n\nconst PROVIDER = 'groq';\nconst QUOTA_COOLDOWN_MINUTES = 30;  // a 429 can be a per-minute or a per-day limit: 30 minutes covers most of both\nconst OUTAGE_COOLDOWN_MINUTES = 5;\nconst NETWORK_CODES = new Set(['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);\n\n// From the HTTP Request node: { message, code, status, stack }. From the parse node: a string.\n// Only the structured fields are read. The stack is never searched: its line numbers\n// (events:521:24) look exactly like HTTP status codes.\nconst error = $input.first().json.error;\nconst message = String(typeof error === 'string' ? error : error?.message ?? 'unknown error');\nconst status = Number(error?.status ?? error?.httpCode) || null;\nconst code = String(error?.code ?? '');\n\nfunction classify() {\n  if (status === 429) return 'quota';\n  if (status >= 500) return 'outage';\n  // Some APIs report an exhausted quota as a 400 or a 403.\n  if (status >= 400) return /quota|rate.?limit|resource.?exhausted/i.test(message) ? 'quota' : 'rejected';\n  if (NETWORK_CODES.has(code)) return 'outage';\n  return 'bad_response';\n}\nconst reason = classify();\n\n// 'rejected' (bad key, unknown model) and 'bad_response' get no cooldown:\n// the first needs a configuration fix that waiting will not bring, the second is often a one-off.\nconst minutes = { quota: QUOTA_COOLDOWN_MINUTES, outage: OUTAGE_COOLDOWN_MINUTES }[reason] ?? 0;\nif (minutes) {\n  const store = $getWorkflowStaticData('global');\n  store.cooldowns ??= {};\n  store.cooldowns[PROVIDER] = Date.now() + minutes * 60e3;\n}\n\nreturn [{\n  json: {\n    ...$('Validate request').first().json,\n    lastFailure: { provider: PROVIDER, reason, status, message: message.slice(0, 300) },\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "51edbd6b-9e2f-427b-bd99-072d7119e1bf",
+      "name": "OpenRouter available?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        940
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "eef81c51-aa69-4be3-9cab-db2589836560",
+              "leftValue": "={{ $json.available.openrouter }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "84909bdb-b0fb-42ff-9677-d5695758b900",
+      "name": "OpenRouter: chat completion",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        940
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "HTTP-Referer",
+              "value": "https://chat.example.com"
+            },
+            {
+              "name": "X-Title",
+              "value": "LLM failover router"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { model: 'openrouter/free', messages: $json.messages, temperature: 0.5, max_tokens: 2048 } }}",
+        "options": {
+          "timeout": 45000
+        }
+      }
+    },
+    {
+      "id": "5a071979-0c46-43ed-8c2c-d575de41646d",
+      "name": "OpenRouter: parse reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        860
+      ],
+      "parameters": {
+        "jsCode": "// Extracts the reply from an OpenAI-compatible response.\n// An empty or malformed answer is thrown on purpose: the node's error output\n// sends it to the failure handler, and the next provider gets a chance.\n\nconst PROVIDER = 'openrouter';\n\nconst response = $input.first().json;\nconst reply = response.choices?.[0]?.message?.content;\nif (typeof reply !== 'string' || !reply.trim()) {\n  throw new Error(`${PROVIDER} returned an empty or malformed response`);\n}\n\nreturn [{\n  json: {\n    ...$('Validate request').first().json,\n    provider: PROVIDER,\n    model: response.model ?? null,\n    reply,\n    usage: response.usage ?? null,\n  },\n}];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "333731b7-3439-4a6a-be4c-b652faf888fe",
+      "name": "OpenRouter: record failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        1060
+      ],
+      "parameters": {
+        "jsCode": "// openrouter has failed: record a cooldown when waiting is likely to help,\n// then hand the untouched conversation to the next provider.\n//\n// An error output carries only { error }, not the item that went in. The context is\n// therefore re-read from 'Validate request'; without this step the next provider\n// would be called with an empty request.\n\nconst PROVIDER = 'openrouter';\nconst QUOTA_COOLDOWN_MINUTES = 30;  // a 429 can be a per-minute or a per-day limit: 30 minutes covers most of both\nconst OUTAGE_COOLDOWN_MINUTES = 5;\nconst NETWORK_CODES = new Set(['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);\n\n// From the HTTP Request node: { message, code, status, stack }. From the parse node: a string.\n// Only the structured fields are read. The stack is never searched: its line numbers\n// (events:521:24) look exactly like HTTP status codes.\nconst error = $input.first().json.error;\nconst message = String(typeof error === 'string' ? error : error?.message ?? 'unknown error');\nconst status = Number(error?.status ?? error?.httpCode) || null;\nconst code = String(error?.code ?? '');\n\nfunction classify() {\n  if (status === 429) return 'quota';\n  if (status >= 500) return 'outage';\n  // Some APIs report an exhausted quota as a 400 or a 403.\n  if (status >= 400) return /quota|rate.?limit|resource.?exhausted/i.test(message) ? 'quota' : 'rejected';\n  if (NETWORK_CODES.has(code)) return 'outage';\n  return 'bad_response';\n}\nconst reason = classify();\n\n// 'rejected' (bad key, unknown model) and 'bad_response' get no cooldown:\n// the first needs a configuration fix that waiting will not bring, the second is often a one-off.\nconst minutes = { quota: QUOTA_COOLDOWN_MINUTES, outage: OUTAGE_COOLDOWN_MINUTES }[reason] ?? 0;\nif (minutes) {\n  const store = $getWorkflowStaticData('global');\n  store.cooldowns ??= {};\n  store.cooldowns[PROVIDER] = Date.now() + minutes * 60e3;\n}\n\nreturn [{\n  json: {\n    ...$('Validate request').first().json,\n    lastFailure: { provider: PROVIDER, reason, status, message: message.slice(0, 300) },\n  },\n}];\n"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate request": {
+      "main": [
+        [
+          {
+            "node": "Respond now?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save turn": {
+      "main": [
+        [
+          {
+            "node": "Respond: reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond now?": {
+      "main": [
+        [
+          {
+            "node": "Respond: immediate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gemini available?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini available?": {
+      "main": [
+        [
+          {
+            "node": "Gemini: chat completion",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Groq available?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: chat completion": {
+      "main": [
+        [
+          {
+            "node": "Gemini: parse reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gemini: record failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: parse reply": {
+      "main": [
+        [
+          {
+            "node": "Save turn",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gemini: record failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: record failure": {
+      "main": [
+        [
+          {
+            "node": "Groq available?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq available?": {
+      "main": [
+        [
+          {
+            "node": "Groq: chat completion",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "OpenRouter available?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq: chat completion": {
+      "main": [
+        [
+          {
+            "node": "Groq: parse reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Groq: record failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq: parse reply": {
+      "main": [
+        [
+          {
+            "node": "Save turn",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Groq: record failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq: record failure": {
+      "main": [
+        [
+          {
+            "node": "OpenRouter available?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter available?": {
+      "main": [
+        [
+          {
+            "node": "OpenRouter: chat completion",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: all providers down",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter: chat completion": {
+      "main": [
+        [
+          {
+            "node": "OpenRouter: parse reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "OpenRouter: record failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter: parse reply": {
+      "main": [
+        [
+          {
+            "node": "Save turn",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "OpenRouter: record failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenRouter: record failure": {
+      "main": [
+        [
+          {
+            "node": "Respond: all providers down",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none"
+  },
+  "tags": []
+}

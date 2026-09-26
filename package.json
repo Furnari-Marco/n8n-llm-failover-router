@@ -1,0 +1,19 @@
+{
+  "name": "n8n-llm-failover-router",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "An n8n chat endpoint that fails over between free LLM providers, rests the ones that are out of quota, and keeps each conversation private.",
+  "scripts": {
+    "test": "node --test tests/workflow.test.mjs",
+    "sync": "node scripts/sync-code.mjs",
+    "sync:check": "node scripts/sync-code.mjs --check",
+    "check": "npm run sync:check && npm test",
+    "e2e:install": "npm install --no-save --no-audit --no-fund n8n@2.40.7",
+    "e2e": "node --test --test-timeout=360000 tests/e2e.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "SEE LICENSE IN LICENSE"
+}
